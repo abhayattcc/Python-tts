@@ -63,7 +63,9 @@ jobs:
         working-directory: piper1-gpl/libpiper
         env:
           NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
+        shell: bash
         run: |
+          set -o pipefail
           # CC/CXX/AR/RANLIB are now set as job-level env vars (from GITHUB_ENV above).
           # CMake checks these before auto-detecting a compiler, and any subprocess
           # cmake invoked by ExternalProject_Add (for espeak-ng) inherits this same
@@ -82,7 +84,10 @@ jobs:
 
       - name: Build libpiper.so
         working-directory: piper1-gpl/libpiper
-        run: cmake --build build --config Release --verbose 2>&1 | tee /tmp/build.log
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --verbose 2>&1 | tee /tmp/build.log
 
       - name: Check espeak-ng static lib architecture (diagnostic)
         if: always()
@@ -98,7 +103,14 @@ jobs:
 
       - name: Install build output
         working-directory: piper1-gpl/libpiper
-        run: cmake --install build
+        run: |
+          if [ ! -f build/libpiper.so ]; then
+            echo "ERROR: build/libpiper.so was not produced. The build step failed silently before this point."
+            echo "Listing build directory contents for diagnosis:"
+            find build -maxdepth 2 -type f -name "*.so" -o -name "*.log" 2>/dev/null || true
+            exit 1
+          fi
+          cmake --install build
 
       - name: Locate and stage .so output
         run: |
