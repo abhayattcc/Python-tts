@@ -42,13 +42,25 @@ OUTPUT_DIR = ROOT / "output"
 PACKAGE_NAME = "org.hear2read.odiatts"
 APP_NAME = "Odia TTS"
 
-# Pinned to v1.2.0: from v1.3.0 onward piper1-gpl dropped its C++ source
-# tree (src/cpp) entirely in favor of a pure-Python implementation, so the
-# JNI bridge below (which calls piper::PiperConfig / loadVoice / textToAudio)
-# has nothing to link against on main. v1.2.0 is the last tag with the
-# classic C++ API this bridge targets.
+# Pinned by COMMIT SHA, not tag: from v1.3.0 onward piper1-gpl dropped its
+# C++ source tree (src/cpp) entirely in favor of a pure-Python
+# implementation, so the JNI bridge below (which calls
+# piper::PiperConfig / loadVoice / textToAudio) has nothing to link
+# against on main or any v1.3.0+ tag.
+#
+# v1.3.0's own release notes name the commit that removed the C++ code:
+#   https://github.com/OHF-Voice/piper1-gpl/releases/tag/v1.3.0  ->  fee9b9c
+# PIPER_REF is therefore fee9b9c's PARENT commit — the last commit where
+# src/cpp still existed. A commit SHA is used instead of a guessed tag
+# name (e.g. "v1.2.0") because there's no confirmed evidence that tag
+# exists on this repo; the SHA below is directly traceable to the
+# changelog line that announced the C++ removal.
+#
+# If this SHA ever stops resolving (force-push/history rewrite), check
+# https://github.com/OHF-Voice/piper1-gpl/commits/main and pick the last
+# commit before "Removed C++ code for now to focus on Python development".
 PIPER_REPO = "https://github.com/OHF-Voice/piper1-gpl.git"
-PIPER_REF = "v1.2.0"
+PIPER_REF = "fee9b9c~1"
 ONNXRUNTIME_VERSION = "1.19.2"
 ONNXRUNTIME_AAR_URL = (
     f"https://repo1.maven.org/maven2/com/microsoft/onnxruntime/"
@@ -103,15 +115,59 @@ def fetch_piper_source():
         print("Already cloned, skipping.")
         return piper_src
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    run(["git", "clone", "--depth", "1", "--branch", PIPER_REF, PIPER_REPO, str(piper_src)])
+
+    # PIPER_REF is a commit SHA expression (e.g. "fee9b9c~1"), not a
+    # branch/tag name, so `git clone --branch` won't resolve it — GitHub's
+    # dumb-http/smart protocol only advertises named refs that way. Instead:
+    # init an empty repo, fetch the specific commit (GitHub allows fetching
+    # by SHA even on repos that don't enable arbitrary commit fetch by
+    # default — falls back to a full clone if that's rejected), then check
+    # it out directly.
+    piper_src.mkdir(parents=True)
+    run(["git", "init"], cwd=piper_src)
+    run(["git", "remote", "add", "origin", PIPER_REPO], cwd=piper_src)
+
+    base_sha = PIPER_REF.split("~")[0].split("^")[0]
+    fetch_result = subprocess.run(
+        ["git", "fetch", "--depth", "200", "origin", base_sha],
+        cwd=piper_src,
+    )
+    if fetch_result.returncode != 0:
+        log("Shallow SHA fetch failed — retrying with full history")
+        fetch_result = subprocess.run(
+            ["git", "fetch", "--unshallow", "origin"], cwd=piper_src
+        )
+        if fetch_result.returncode != 0:
+            # repo has no shallow fetch to deepen yet — do a plain full fetch
+            run(["git", "fetch", "origin"], cwd=piper_src)
+
+    checkout_result = subprocess.run(
+        ["git", "checkout", PIPER_REF], cwd=piper_src
+    )
+    if checkout_result.returncode != 0:
+        log("Checkout of pinned ref failed — fetching full history as last resort")
+        run(["git", "fetch", "--unshallow", "origin"], cwd=piper_src)
+        checkout_result = subprocess.run(
+            ["git", "checkout", PIPER_REF], cwd=piper_src
+        )
+
+    if checkout_result.returncode != 0:
+        sys.exit(
+            f"Could not check out piper1-gpl commit '{PIPER_REF}'. The pin "
+            "in this script may be stale (history rewritten, or it no "
+            f"longer exists). Check {PIPER_REPO} manually, find the "
+            "last commit before C++ removal (see comment above PIPER_REF "
+            "in this file), and update PIPER_REF to that commit's exact SHA."
+        )
+
     cpp_check = piper_src / "src" / "cpp" / "piper.hpp"
     if not cpp_check.exists():
         sys.exit(
             f"Expected {cpp_check} to exist in piper1-gpl@{PIPER_REF} but it "
-            "doesn't. Upstream layout may have changed again — check "
-            "https://github.com/OHF-Voice/piper1-gpl/tree/"
-            f"{PIPER_REF}/src/cpp and update jni_bridge.cpp / CMakeLists.txt "
-            "in this script to match."
+            "doesn't. Upstream layout may differ from what this script "
+            "assumes — check the checked-out tree under "
+            f"{piper_src} and update jni_bridge.cpp / CMakeLists.txt in "
+            "this script to match."
         )
     return piper_src
 
