@@ -11,7 +11,6 @@ on:
         options:
           - arm64-v8a
           - armeabi-v7a
-          - x86_64
 
 jobs:
   build:
@@ -34,19 +33,68 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build build-essential
 
+      - name: Resolve Android toolchain binaries and export as env vars
+        id: ndk-env
+        run: |
+          NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ABI="${{ github.event.inputs.abi }}"
+
+          if [ "$ABI" = "arm64-v8a" ]; then
+            TRIPLE="aarch64-linux-android"
+          else
+            TRIPLE="armv7a-linux-androideabi"
+          fi
+          API=24
+
+          echo "TOOLCHAIN_BIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+          echo "CC=$TOOLCHAIN/${TRIPLE}${API}-clang" >> "$GITHUB_ENV"
+          echo "CXX=$TOOLCHAIN/${TRIPLE}${API}-clang++" >> "$GITHUB_ENV"
+          echo "AR=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB=$TOOLCHAIN/llvm-ranlib" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "NDK_TRIPLE=$TRIPLE" >> "$GITHUB_ENV"
+          echo "NDK_API=$API" >> "$GITHUB_ENV"
+
+          echo "Resolved compiler: $TOOLCHAIN/${TRIPLE}${API}-clang"
+          ls -la "$TOOLCHAIN/${TRIPLE}${API}-clang" || echo "WARNING: compiler binary not found at expected path, build will fail"
+
       - name: Configure CMake for Android
         working-directory: piper1-gpl/libpiper
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          # CC/CXX/AR/RANLIB are now set as job-level env vars (from GITHUB_ENV above).
+          # CMake checks these before auto-detecting a compiler, and any subprocess
+          # cmake invoked by ExternalProject_Add (for espeak-ng) inherits this same
+          # environment, so it cross-compiles instead of silently using host glibc.
           cmake -Bbuild -GNinja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE=${{ steps.setup-ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+            -DCMAKE_SYSTEM_NAME=Android \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_PATH/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=${{ github.event.inputs.abi }} \
-            -DANDROID_PLATFORM=android-24 \
-            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
+            -DANDROID_PLATFORM=android-$NDK_API \
+            -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
+            2>&1 | tee /tmp/configure.log
 
       - name: Build libpiper.so
         working-directory: piper1-gpl/libpiper
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --verbose 2>&1 | tee /tmp/build.log
+
+      - name: Check espeak-ng static lib architecture (diagnostic)
+        if: always()
+        working-directory: piper1-gpl/libpiper
+        run: |
+          ESPEAK_OBJ=$(find build -name "*.c.o" -path "*espeak*" | head -n1)
+          if [ -n "$ESPEAK_OBJ" ]; then
+            echo "Sample espeak-ng object file: $ESPEAK_OBJ"
+            file "$ESPEAK_OBJ" || true
+          else
+            echo "No espeak-ng object files found yet (build may have failed earlier)"
+          fi
 
       - name: Install build output
         working-directory: piper1-gpl/libpiper
@@ -58,6 +106,16 @@ jobs:
           find ${{ github.workspace }}/install -name "*.so" -exec cp {} output/ \;
           find piper1-gpl/libpiper/build -name "*.so" -exec cp {} output/ \; || true
           ls -la output/
+
+      - name: Upload build logs (always, for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.event.inputs.abi }}
+          path: |
+            /tmp/configure.log
+            /tmp/build.log
+          if-no-files-found: warn
 
       - name: Upload libpiper.so artifact
         uses: actions/upload-artifact@v4
