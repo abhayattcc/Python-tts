@@ -42,7 +42,13 @@ OUTPUT_DIR = ROOT / "output"
 PACKAGE_NAME = "org.hear2read.odiatts"
 APP_NAME = "Odia TTS"
 
+# Pinned to v1.2.0: from v1.3.0 onward piper1-gpl dropped its C++ source
+# tree (src/cpp) entirely in favor of a pure-Python implementation, so the
+# JNI bridge below (which calls piper::PiperConfig / loadVoice / textToAudio)
+# has nothing to link against on main. v1.2.0 is the last tag with the
+# classic C++ API this bridge targets.
 PIPER_REPO = "https://github.com/OHF-Voice/piper1-gpl.git"
+PIPER_REF = "v1.2.0"
 ONNXRUNTIME_VERSION = "1.19.2"
 ONNXRUNTIME_AAR_URL = (
     f"https://repo1.maven.org/maven2/com/microsoft/onnxruntime/"
@@ -91,13 +97,22 @@ def check_inputs():
 # ---------------------------------------------------------------------------
 
 def fetch_piper_source():
-    log("Fetching piper1-gpl source")
+    log(f"Fetching piper1-gpl source @ {PIPER_REF}")
     piper_src = WORK_DIR / "piper1-gpl"
     if piper_src.exists():
         print("Already cloned, skipping.")
         return piper_src
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    run(["git", "clone", "--depth", "1", PIPER_REPO, str(piper_src)])
+    run(["git", "clone", "--depth", "1", "--branch", PIPER_REF, PIPER_REPO, str(piper_src)])
+    cpp_check = piper_src / "src" / "cpp" / "piper.hpp"
+    if not cpp_check.exists():
+        sys.exit(
+            f"Expected {cpp_check} to exist in piper1-gpl@{PIPER_REF} but it "
+            "doesn't. Upstream layout may have changed again — check "
+            "https://github.com/OHF-Voice/piper1-gpl/tree/"
+            f"{PIPER_REF}/src/cpp and update jni_bridge.cpp / CMakeLists.txt "
+            "in this script to match."
+        )
     return piper_src
 
 
@@ -257,6 +272,12 @@ def generate_gradle_project(onnxruntime_dir: Path):
 
             <uses-permission android:name="android.permission.INTERNET" />
         <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+        <!-- Only needed on API <= 28 for saving exported AAC files to the
+             public Music folder; API 29+ uses MediaStore instead, which
+             needs no storage permission. -->
+        <uses-permission
+            android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+            android:maxSdkVersion="28" />
 
             <application
                 android:allowBackup="true"
@@ -290,17 +311,17 @@ def generate_gradle_project(onnxruntime_dir: Path):
         </manifest>
     """)
 
-    # --- res/xml/tts_engine.xml (declares the voice/locale to Android) ---
+    # --- res/xml/tts_engine.xml (declares this app as a TTS engine to Android) ---
+    # NOTE: android:locale / android:quality / android:latency /
+    # android:requiresNetworkConnection are NOT real framework attributes —
+    # there is no public per-voice metadata schema for TextToSpeechService
+    # voices via this XML (that caused the AAPT "attribute not found" build
+    # failures). Voice/locale availability is reported in code instead, via
+    # OdiaTtsService.onGetLanguage() / onIsLanguageAvailable() / getVoices().
+    # This file just needs to exist and be referenced from the manifest.
     write(PROJECT_DIR / "app" / "src" / "main" / "res" / "xml" / "tts_engine.xml", """
         <?xml version="1.0" encoding="utf-8"?>
-        <voices xmlns:android="http://schemas.android.com/apk/res/android">
-            <voice
-                android:name="or-tdil-low"
-                android:locale="or_IN"
-                android:quality="200"
-                android:latency="200"
-                android:requiresNetworkConnection="false" />
-        </voices>
+        <voices xmlns:android="http://schemas.android.com/apk/res/android" />
     """)
 
     # --- JNI / C++ bridge ---
@@ -638,16 +659,31 @@ def generate_kotlin_sources(pkg_path: str):
     write(kt_dir / "MainActivity.kt", f"""
         package {PACKAGE_NAME}
 
+        import android.content.ContentValues
         import android.media.AudioFormat
         import android.media.AudioManager
         import android.media.AudioTrack
+        import android.media.MediaCodec
+        import android.media.MediaCodecInfo
+        import android.media.MediaFormat
+        import android.media.MediaMuxer
+        import android.os.Build
         import android.os.Bundle
+        import android.os.Environment
+        import android.provider.MediaStore
+        import android.text.InputType
+        import android.view.Gravity
+        import android.view.ViewGroup
         import android.widget.Button
         import android.widget.EditText
         import android.widget.LinearLayout
         import android.widget.ProgressBar
+        import android.widget.ScrollView
         import android.widget.TextView
+        import android.widget.Toast
         import androidx.appcompat.app.AppCompatActivity
+        import java.io.File
+        import java.nio.ByteBuffer
         import kotlin.concurrent.thread
 
         class MainActivity : AppCompatActivity() {{
@@ -656,32 +692,77 @@ def generate_kotlin_sources(pkg_path: str):
             private lateinit var statusText: TextView
             private lateinit var progressBar: ProgressBar
             private lateinit var speakButton: Button
+            private lateinit var exportButton: Button
             private lateinit var input: EditText
+
+            private val sampleRate = 22050 // must match your model's sample_rate in model.onnx.json
 
             override fun onCreate(savedInstanceState: Bundle?) {{
                 super.onCreate(savedInstanceState)
 
+                val pad = (16 * resources.displayMetrics.density).toInt()
+
                 val layout = LinearLayout(this)
                 layout.orientation = LinearLayout.VERTICAL
-                val pad = (16 * resources.displayMetrics.density).toInt()
                 layout.setPadding(pad, pad, pad, pad)
 
                 statusText = TextView(this)
                 statusText.text = "Checking voice model..."
+
                 progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
                 progressBar.max = 100
 
+                // --- Unlimited-length, easy-to-read text input ---
+                // No maxLength / InputFilter is set, so the field accepts text of
+                // any length. It's wrapped in its own ScrollView with a fixed
+                // height so long text scrolls within the box instead of pushing
+                // the Speak/Export buttons off-screen, and font size + line
+                // spacing are bumped up for readability.
                 input = EditText(this)
-                input.hint = "Type Odia text here"
+                input.hint = "Type or paste Odia text here (any length)"
+                input.inputType = (
+                    InputType.TYPE_CLASS_TEXT or
+                    InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                    InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+                )
+                input.gravity = Gravity.TOP or Gravity.START
+                input.minLines = 6
+                input.textSize = 18f
+                input.setLineSpacing(8f, 1.2f)
+                input.setPadding(pad, pad, pad, pad)
+                input.isVerticalScrollBarEnabled = true
+
+                val inputScroll = ScrollView(this)
+                inputScroll.layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    (260 * resources.displayMetrics.density).toInt()
+                )
+                inputScroll.addView(input)
+
+                val buttonRow = LinearLayout(this)
+                buttonRow.orientation = LinearLayout.HORIZONTAL
 
                 speakButton = Button(this)
                 speakButton.text = "Speak"
                 speakButton.isEnabled = false
+                speakButton.layoutParams = LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+                )
+
+                exportButton = Button(this)
+                exportButton.text = "Export to AAC"
+                exportButton.isEnabled = false
+                exportButton.layoutParams = LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+                )
+
+                buttonRow.addView(speakButton)
+                buttonRow.addView(exportButton)
 
                 layout.addView(statusText)
                 layout.addView(progressBar)
-                layout.addView(input)
-                layout.addView(speakButton)
+                layout.addView(inputScroll)
+                layout.addView(buttonRow)
                 setContentView(layout)
 
                 bridge = PiperBridge()
@@ -690,11 +771,51 @@ def generate_kotlin_sources(pkg_path: str):
 
                 speakButton.setOnClickListener {{
                     val text = input.text.toString()
+                    if (text.isBlank()) {{
+                        Toast.makeText(this, "Type some text first", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }}
+                    setBusy(true, "Synthesizing...")
                     thread {{
-                        val samples = bridge.synthesize(text)
-                        playAudio(samples)
+                        try {{
+                            val samples = bridge.synthesize(text)
+                            playAudio(samples)
+                            runOnUiThread {{ setBusy(false, "Ready") }}
+                        }} catch (e: Exception) {{
+                            runOnUiThread {{ setBusy(false, "Speak failed: ${{e.message}}") }}
+                        }}
                     }}
                 }}
+
+                exportButton.setOnClickListener {{
+                    val text = input.text.toString()
+                    if (text.isBlank()) {{
+                        Toast.makeText(this, "Type some text first", Toast.LENGTH_SHORT).show()
+                        return@setOnClickListener
+                    }}
+                    setBusy(true, "Synthesizing for export...")
+                    thread {{
+                        try {{
+                            val samples = bridge.synthesize(text)
+                            runOnUiThread {{ statusText.text = "Encoding AAC..." }}
+                            val savedPath = exportToAac(samples)
+                            runOnUiThread {{
+                                setBusy(false, "Saved: $savedPath")
+                                Toast.makeText(
+                                    this, "Saved to $savedPath", Toast.LENGTH_LONG
+                                ).show()
+                            }}
+                        }} catch (e: Exception) {{
+                            runOnUiThread {{ setBusy(false, "Export failed: ${{e.message}}") }}
+                        }}
+                    }}
+                }}
+            }}
+
+            private fun setBusy(busy: Boolean, message: String) {{
+                statusText.text = message
+                speakButton.isEnabled = !busy
+                exportButton.isEnabled = !busy
             }}
 
             /** Downloads the model on first launch (skips if already cached),
@@ -721,7 +842,7 @@ def generate_kotlin_sources(pkg_path: str):
 
                         runOnUiThread {{ statusText.text = "Loading voice engine..." }}
 
-                        val espeakDir = java.io.File(filesDir, "espeak-ng-data")
+                        val espeakDir = File(filesDir, "espeak-ng-data")
                         AssetExtractor.extractAssetDir(this, "espeak-ng-data", espeakDir)
 
                         val ok = bridge.init(
@@ -735,6 +856,7 @@ def generate_kotlin_sources(pkg_path: str):
                                 statusText.text = "Ready"
                                 progressBar.progress = 100
                                 speakButton.isEnabled = true
+                                exportButton.isEnabled = true
                             }} else {{
                                 statusText.text = "Failed to load voice engine"
                             }}
@@ -749,7 +871,6 @@ def generate_kotlin_sources(pkg_path: str):
 
             private fun playAudio(samples: FloatArray) {{
                 if (samples.isEmpty()) return
-                val sampleRate = 22050 // must match your model's sample_rate in model.onnx.json
                 val track = AudioTrack.Builder()
                     .setAudioFormat(
                         AudioFormat.Builder()
@@ -764,6 +885,154 @@ def generate_kotlin_sources(pkg_path: str):
                     .build()
                 track.write(samples, 0, samples.size, AudioTrack.WRITE_BLOCKING)
                 track.play()
+            }}
+
+            /**
+             * Encodes float PCM samples to AAC (.m4a, ADTS-free / MP4 container
+             * via MediaMuxer) using the platform AAC-LC encoder, then saves the
+             * result. On API 29+ this goes through MediaStore into the public
+             * Music/OdiaTTS folder; on older versions it falls back to the
+             * app's external files directory (no extra permission needed
+             * either way). Returns a human-readable path/description for the
+             * "Saved: ..." status message.
+             */
+            private fun exportToAac(samples: FloatArray): String {{
+                if (samples.isEmpty()) throw IllegalStateException("No audio produced")
+
+                // Convert float [-1, 1] PCM to 16-bit PCM bytes (little-endian),
+                // which is what the AAC encoder's input format expects.
+                val pcm16 = ShortArray(samples.size)
+                for (i in samples.indices) {{
+                    val v = (samples[i] * 32767.0f).toInt().coerceIn(-32768, 32767)
+                    pcm16[i] = v.toShort()
+                }}
+                val pcmBytes = ByteArray(pcm16.size * 2)
+                for (i in pcm16.indices) {{
+                    pcmBytes[i * 2] = (pcm16[i].toInt() and 0xFF).toByte()
+                    pcmBytes[i * 2 + 1] = ((pcm16[i].toInt() shr 8) and 0xFF).toByte()
+                }}
+
+                val fileName = "odia_tts_${{System.currentTimeMillis()}}.m4a"
+                val tempFile = File(cacheDir, fileName)
+
+                encodePcmToAacFile(pcmBytes, tempFile)
+
+                return saveAacToPublicStorage(tempFile, fileName)
+            }}
+
+            private fun encodePcmToAacFile(pcmBytes: ByteArray, outFile: File) {{
+                val format = MediaFormat.createAudioFormat(
+                    MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 1
+                )
+                format.setInteger(
+                    MediaFormat.KEY_AAC_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AACObjectLC
+                )
+                format.setInteger(MediaFormat.KEY_BIT_RATE, 128000)
+
+                val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+                codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                codec.start()
+
+                val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                var trackIndex = -1
+                var muxerStarted = false
+
+                var offset = 0
+                var sawInputEOS = false
+                var sawOutputEOS = false
+                val bufferInfo = MediaCodec.BufferInfo()
+                val timeoutUs = 10000L
+
+                while (!sawOutputEOS) {{
+                    if (!sawInputEOS) {{
+                        val inIndex = codec.dequeueInputBuffer(timeoutUs)
+                        if (inIndex >= 0) {{
+                            val inBuffer: ByteBuffer = codec.getInputBuffer(inIndex)!!
+                            inBuffer.clear()
+                            val remaining = pcmBytes.size - offset
+                            val toWrite = minOf(inBuffer.capacity(), remaining)
+                            if (toWrite <= 0) {{
+                                codec.queueInputBuffer(
+                                    inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM
+                                )
+                                sawInputEOS = true
+                            }} else {{
+                                inBuffer.put(pcmBytes, offset, toWrite)
+                                val presentationTimeUs =
+                                    (offset.toLong() / 2) * 1_000_000L / sampleRate
+                                codec.queueInputBuffer(
+                                    inIndex, 0, toWrite, presentationTimeUs, 0
+                                )
+                                offset += toWrite
+                            }}
+                        }}
+                    }}
+
+                    var outIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                    while (outIndex >= 0) {{
+                        val outBuffer = codec.getOutputBuffer(outIndex)
+                        if (outBuffer != null && bufferInfo.size > 0 && muxerStarted) {{
+                            outBuffer.position(bufferInfo.offset)
+                            outBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                            muxer.writeSampleData(trackIndex, outBuffer, bufferInfo)
+                        }}
+                        val isEOS = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                        codec.releaseOutputBuffer(outIndex, false)
+                        if (isEOS) {{
+                            sawOutputEOS = true
+                            outIndex = -2
+                        }} else {{
+                            outIndex = codec.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                        }}
+                    }}
+                    if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {{
+                        trackIndex = muxer.addTrack(codec.outputFormat)
+                        muxer.start()
+                        muxerStarted = true
+                    }}
+                }}
+
+                codec.stop()
+                codec.release()
+                if (muxerStarted) {{
+                    muxer.stop()
+                }}
+                muxer.release()
+            }}
+
+            /** Copies the encoded .m4a into public storage so it shows up in
+             * the user's Music app / file manager, then deletes the temp copy. */
+            private fun saveAacToPublicStorage(tempFile: File, fileName: String): String {{
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {{
+                    val values = ContentValues().apply {{
+                        put(MediaStore.Audio.Media.DISPLAY_NAME, fileName)
+                        put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                        put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/OdiaTTS")
+                        put(MediaStore.Audio.Media.IS_PENDING, 1)
+                    }}
+                    val resolver = contentResolver
+                    val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("Could not create MediaStore entry")
+                    resolver.openOutputStream(uri)?.use {{ out ->
+                        tempFile.inputStream().use {{ input -> input.copyTo(out) }}
+                    }}
+                    values.clear()
+                    values.put(MediaStore.Audio.Media.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    tempFile.delete()
+                    return "Music/OdiaTTS/$fileName"
+                }} else {{
+                    val musicDir = Environment.getExternalStoragePublicDirectory(
+                        Environment.DIRECTORY_MUSIC
+                    )
+                    val destDir = File(musicDir, "OdiaTTS")
+                    destDir.mkdirs()
+                    val destFile = File(destDir, fileName)
+                    tempFile.copyTo(destFile, overwrite = true)
+                    tempFile.delete()
+                    return destFile.absolutePath
+                }}
             }}
 
             override fun onDestroy() {{
