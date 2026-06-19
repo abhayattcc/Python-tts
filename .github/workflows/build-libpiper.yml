@@ -33,6 +33,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build build-essential
 
+      - name: Build native espeak-ng (host binary, needed by data-file generation step)
+        shell: bash
+        run: |
+          set -o pipefail
+          # The Android cross-compile produces an ARM64 espeak-ng binary that
+          # cannot run on this x86_64 runner. But espeak-ng's own build calls
+          # that binary BY ABSOLUTE PATH (not via PATH lookup) to generate data
+          # files like espeak-ng-data/intonations. So a PATH-based override
+          # won't intercept it -- we instead build a native binary here, then
+          # after the cross-compile produces its (unexecutable) ARM64 copy at
+          # the same relative location, we swap our native one in before the
+          # data-generation step runs. See the "Swap in native espeak-ng binary"
+          # step further down for where this is actually used.
+          git clone --depth 1 https://github.com/espeak-ng/espeak-ng.git /tmp/espeak-ng-native
+          cd /tmp/espeak-ng-native
+          cmake -Bbuild -GNinja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_LIBSONIC=OFF \
+            -DUSE_LIBPCAUDIO=OFF -DUSE_KLATT=OFF -DUSE_SPEECHPLAYER=OFF
+          cmake --build build
+          mkdir -p /tmp/native-bin
+          find build -maxdepth 2 -type f -name "espeak-ng" -exec cp {} /tmp/native-bin/espeak-ng \;
+          chmod +x /tmp/native-bin/espeak-ng
+          /tmp/native-bin/espeak-ng --version
+
       - name: Resolve Android toolchain binaries and export as env vars
         id: ndk-env
         run: |
@@ -82,7 +108,31 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
             2>&1 | tee /tmp/configure.log
 
-      - name: Build libpiper.so
+      - name: Build libpiper.so (first pass, expected to stop at espeak-ng data generation)
+        working-directory: piper1-gpl/libpiper
+        shell: bash
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --verbose 2>&1 | tee /tmp/build-pass1.log || true
+
+      - name: Swap in native espeak-ng binary so data-file generation can run
+        working-directory: piper1-gpl/libpiper
+        run: |
+          TARGET=$(find build -path "*espeak_ng_external-build/src/espeak-ng" -type f | head -n1)
+          if [ -z "$TARGET" ]; then
+            echo "ERROR: could not find the cross-compiled espeak-ng binary path. Build may have failed earlier than expected."
+            echo "Showing last 60 lines of pass 1 build log:"
+            tail -n 60 /tmp/build-pass1.log
+            exit 1
+          fi
+          echo "Found cross-compiled (unexecutable) binary at: $TARGET"
+          file "$TARGET" || true
+          cp /tmp/native-bin/espeak-ng "$TARGET"
+          chmod +x "$TARGET"
+          echo "Replaced with native host binary:"
+          file "$TARGET" || true
+
+      - name: Build libpiper.so (second pass, resumes past data generation)
         working-directory: piper1-gpl/libpiper
         shell: bash
         run: |
@@ -126,6 +176,7 @@ jobs:
           name: build-logs-${{ github.event.inputs.abi }}
           path: |
             /tmp/configure.log
+            /tmp/build-pass1.log
             /tmp/build.log
           if-no-files-found: warn
 
