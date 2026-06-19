@@ -252,7 +252,7 @@ def generate_gradle_project(onnxruntime_dir: Path):
     # --- AndroidManifest.xml ---
     write(PROJECT_DIR / "app" / "src" / "main" / "AndroidManifest.xml", f"""
         <?xml version="1.0" encoding="utf-8"?>
-        <manifest xmlns:android="http://schemas.android.com/apk/res/auto"
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android"
             xmlns:tools="http://schemas.android.com/tools">
 
             <uses-permission android:name="android.permission.INTERNET" />
@@ -293,7 +293,7 @@ def generate_gradle_project(onnxruntime_dir: Path):
     # --- res/xml/tts_engine.xml (declares the voice/locale to Android) ---
     write(PROJECT_DIR / "app" / "src" / "main" / "res" / "xml" / "tts_engine.xml", """
         <?xml version="1.0" encoding="utf-8"?>
-        <voices xmlns:android="http://schemas.android.com/apk/res/auto">
+        <voices xmlns:android="http://schemas.android.com/apk/res/android">
             <voice
                 android:name="or-tdil-low"
                 android:locale="or_IN"
